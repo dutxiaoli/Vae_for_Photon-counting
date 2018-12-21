@@ -1,0 +1,368 @@
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.nn as nn
+import argparse
+import os
+from torch.autograd import Variable
+from torch.utils.data import DataLoader
+import numpy as np
+import time
+import torchvision
+from dataset import MyData, MyTestData
+from torchvision.utils import save_image
+configurations = {
+    # same configuration as original work
+    # https://github.com/shelhamer/fcn.berkeleyvision.org
+    1: dict(
+        max_iteration=400000,
+        lr=1.0e-10,
+        momentum=0.99,
+        weight_decay=0.0005,
+
+    )
+
+}
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--phase', type=str, default='test', help='train or test')
+parser.add_argument('--param', type=str, default=None, help='path to pre-trained parameters')
+#parser.add_argument('--train_dataroot', type=str, default='/media/lixiao/新加卷/学习资料/李啸/第五阶段/pc dnn', help='path to train data')
+#parser.add_argument('--test_dataroot', type=str, default='/media/lixiao/新加卷/学习资料/李啸/第五阶段/pc dnn/LF_data/allfocus/', help='path to test data')
+parser.add_argument('--train_dataroot', type=str, default='./train_data', help='path to train data')
+parser.add_argument('--test_dataroot', type=str, default='/media/lixiao/新加卷1/学习资料/李啸/第五阶段/pc dnn/LF_data/allfocus/', help='path to test data')
+parser.add_argument('--snapshot_root', type=str, default='./snapshot', help='path to snapshot')
+parser.add_argument('--reconstruct_root', type=str, default='./reconstruct_map', help='path to reconstruct map')
+parser.add_argument('--generate_root', type=str, default='./generate_map', help='path to generate map')
+parser.add_argument('-c', '--config', type=int, default=1, choices=configurations.keys())
+parser.add_argument('--resume', help='Checkpoint path')
+parser.add_argument('--snapshot_opt_root', type=str, default='./snapshot_opt', help='path to snapshot optimize')
+
+#parser.add_argument('--train_dataroot', type=str, default='./train_data/photon counting/', help='path to train data')
+#parser.add_argument('--test_dataroot', type=str, default='/media/lixiao/新加卷1/学习资料/李啸/第五阶段/pc dnn/LF_data/allfocus/', help='path to test data')
+
+args = parser.parse_args()
+cfg = configurations[args.config]
+
+train_dataroot = args.train_dataroot
+test_dataroot = args.test_dataroot
+
+if not os.path.exists(args.snapshot_root):
+    os.mkdir(args.snapshot_root)
+if not os.path.exists(args.reconstruct_root):
+    os.mkdir(args.reconstruct_root)
+if not os.path.exists(args.generate_root):
+    os.mkdir(args.generate_root)
+if not os.path.exists(args.snapshot_opt_root):
+    os.mkdir(args.snapshot_opt_root)
+
+cuda = torch.cuda.is_available
+
+
+class Encoder(torch.nn.Module):
+    def __init__(self, D_in, H, D_out):
+        super(Encoder, self).__init__()
+
+        # vggnet
+
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear')
+        self.vgg_pre = []
+        #Conv1
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True)
+        )
+
+        #Conv2
+        self.conv2 = nn.Sequential(
+            nn.MaxPool2d(2, stride=2, ceil_mode=True),  #1/2
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True)
+        )
+
+        #Conv3
+        self.conv3 = nn.Sequential(
+            nn.MaxPool2d(2, stride=2, ceil_mode=True),  # 1/4
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, padding=1),
+            nn.BatchNorm2d(256, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+        )
+
+        #Conv4
+        self.conv4 = nn.Sequential(
+            nn.MaxPool2d(2, stride=2, ceil_mode=True),  # 1/8
+            nn.Conv2d(256, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True)
+        )
+
+        #Conv5
+        self.conv5 = nn.Sequential(
+            nn.MaxPool2d(2, stride=2, ceil_mode=True),  # 1/16
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, padding=1),
+            nn.BatchNorm2d(512, eps=1e-05, momentum=0.1, affine=True),
+            nn.ReLU(inplace=True)
+        )
+
+
+
+        #Conv5 add
+        self.conv5_c = nn.Conv2d(512, 64, 3, padding=1)
+        self.conv5_p = nn.Conv2d(64, 1, 3, padding=1)
+
+        #Conv4 add
+        self.conv4_c = nn.Conv2d(512, 64, 3, padding=1)
+        self.conv4_p = nn.Conv2d(64, 1, 3, padding=1)
+
+        #Conv3 add
+        self.conv3_c = nn.Conv2d(256, 64, 3, padding=1)
+        self.conv3_p = nn.Conv2d(64, 1, 3, padding=1)
+
+        #Conv2 add
+        self.conv2_c = nn.Conv2d(128, 64, 3, padding=1)
+        self.conv2_p = nn.Conv2d(64, 1, 3, padding=1)
+
+        #Conv1 add
+        self.conv1_c = nn.Conv2d(64, 64, 3, padding=1)
+        self.conv1_p = nn.Conv2d(64, 1, 3, padding=1)
+
+
+        self._initialize_weights()
+
+        self.__copy_param()
+
+    def _initialize_weights(self):
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    # m.weight.data.zero_()
+                    nn.init.normal(m.weight.data, std=0.01)
+                    if m.bias is not None:
+                        m.bias.data.zero_()
+
+    def forward(self, x):
+
+        h = x
+
+        h = self.conv1(h)
+        h_nopool1 = h
+
+        h = self.conv2(h)
+        h_nopool2 = h
+
+        h = self.conv3(h)
+        h_nopool3 = h
+
+        h = self.conv4(h)
+        h_nopool4 = h
+
+        h = self.conv5(h)
+
+
+        return h
+    def __copy_param(self):
+
+        # Get pretrained vgg19 network
+        vgg19 = torchvision.models.vgg19_bn(pretrained=True)
+
+        # Concatenate layers of generator network
+        DGG_features = list(self.conv1.children())
+        DGG_features.extend(list(self.conv2.children()))
+        DGG_features.extend(list(self.conv3.children()))
+        DGG_features.extend(list(self.conv4.children()))
+        DGG_features.extend(list(self.conv5.children()))
+        DGG_features = nn.Sequential(*DGG_features)
+
+        # Copy parameters from vgg19
+        for layer_1, layer_2 in zip(vgg19.features, DGG_features):
+            if (isinstance(layer_1, nn.Conv2d) and
+                    isinstance(layer_2, nn.Conv2d)):
+                assert layer_1.weight.size() == layer_2.weight.size()
+                assert layer_1.bias.size() == layer_2.bias.size()
+                layer_2.weight.data = layer_1.weight.data
+                layer_2.bias.data = layer_1.bias.data
+        return
+
+
+
+
+class Decoder(torch.nn.Module):
+    def __init__(self, D_in, H, D_out):
+        super(Decoder, self).__init__()
+        self.conv1 = nn.Conv2d(D_in, 128, 3, padding=1)
+        self.conv2 = nn.Conv2d(128, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 32, 3, padding=1)
+        self.conv4 = nn.Conv2d(32, 3, 3, padding=1)
+        self.relu = nn.ReLU()
+        self.bn1 = nn.BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True)
+        self.bn2 = nn.BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True)
+        self.bn3 = nn.BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True)
+        # self.bn4 = nn.BatchNorm2d(3, eps=1e-05, momentum=0.1, affine=True)
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+
+    def forward(self, x):
+        x = self.upsample(x)  # 1/8
+        out1 = self.conv1(x)
+        out1 = self.relu(out1)
+        out1 = self.bn1(out1)
+        out1 = self.upsample(out1)  # 1/4
+        out2 = self.conv2(out1)
+        out2 = self.relu(out2)
+        out2 = self.bn2(out2)
+        out2 = self.upsample(out2)  # 1/2
+        out3 = self.conv3(out2)
+        out3 = self.relu(out3)
+        out3 = self.bn3(out3)
+        out3 = self.upsample(out3)  # 1
+        out4 = self.conv4(out3)
+        out4 = self.relu(out4)
+
+        return out4
+
+
+class VAE(torch.nn.Module):
+    latent_dim = 256
+
+    def __init__(self, encoder, decoder):
+        super(VAE, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self._enc_mu = torch.nn.Conv2d(512, latent_dim, 3, padding=1)
+        self._enc_log_sigma = torch.nn.Conv2d(512, latent_dim, 3, padding=1)
+
+    def _sample_latent(self, h_enc):
+        """
+        Return the latent normal sample z ~ N(mu, sigma^2)
+        """
+        mu = self._enc_mu(h_enc)
+        log_sigma = self._enc_log_sigma(h_enc)
+        sigma = torch.exp(log_sigma)
+        std_z = torch.from_numpy(np.random.normal(0, 1, size=sigma.size())).float().cuda()
+
+        self.z_mean = mu
+        self.z_sigma = sigma
+
+        return mu + sigma * Variable(std_z, requires_grad=False)  # Reparameterization trick
+
+    def forward(self, state):
+        h_enc = self.encoder(state)
+        z = self._sample_latent(h_enc)
+        latent_size = z.size()
+        return self.decoder(z), latent_size
+
+
+def latent_loss(z_mean, z_stddev):
+    mean_sq = z_mean * z_mean
+    stddev_sq = z_stddev * z_stddev
+    return 0.5 * torch.mean(mean_sq + stddev_sq - torch.log(stddev_sq) - 1)
+
+
+def save_reconstruct_img(dst_data, recon_data, epoch, batch_size):
+    dst_data = dst_data.cpu()
+    recon_data = recon_data.cpu()
+    n = min(dst_data.size(0), 8)
+    comparison = torch.cat([(dst_data[:n].view(n, 3, 256, 256)),
+                            (recon_data[:n].view(n, 3, 256, 256))])
+    save_image(comparison.data,
+               'reconstruct_map/reconstruction_' + str(epoch) + '.png', nrow=n)
+
+
+def sample_and_construct(epoch, decoder, latent_size):
+    sample = Variable(torch.randn(latent_size).cuda())
+    sample = decoder(sample)
+    sample = sample.cpu()
+    save_image(sample.data,
+               'generate_map/sample_' + str(epoch) + '.png')
+
+
+if __name__ == '__main__':
+    batch_size = 8
+    latent_dim = 256
+    start = time.clock()
+
+    train_loader = torch.utils.data.DataLoader(MyData(train_dataroot, transform=True),
+                                               batch_size=8, shuffle=False, num_workers=4, pin_memory=True)
+
+
+    encoder = Encoder(3, 100, 512)
+    decoder = Decoder(latent_dim, 100, 3)
+    vae = VAE(encoder, decoder)
+
+    criterion = nn.MSELoss()
+
+    # add cuda
+    vae.cuda()
+    criterion.cuda()
+
+    optimizer = optim.Adam(vae.parameters(), lr=0.00002)
+    l = None
+    for epoch in range(1270,1500):
+
+        if (epoch != 0):
+            print("\nloading parameters")
+            vae.load_state_dict(torch.load(args.snapshot_root + '/feature-current.pth'))
+            optimizer.load_state_dict(torch.load(args.snapshot_opt_root + '/opti-current.pth'))
+            #
+        title = 'Training Epoch {}'.format(epoch)
+
+        print("epoch: %d", (epoch))
+        for i, data  in enumerate(train_loader, 0):
+            inputs, classes = data
+            inputs, classes = Variable(inputs).cuda(), Variable(classes).cuda()
+
+            optimizer.zero_grad()
+            dec, latent_size = vae(inputs)
+            ll = latent_loss(vae.z_mean, vae.z_sigma)
+            loss = criterion(dec, inputs) + ll
+            loss.backward()
+            optimizer.step()
+            # l = loss.data[0]
+            l = loss.item()
+
+        elapsed = (time.clock() - start)
+        print(epoch, l, 'time:', elapsed)
+        save_reconstruct_img(inputs, dec, epoch, batch_size)
+        sample_and_construct(epoch, decoder, latent_size)
+
+        filename = ('%s/feature_%d.pth' % (args.snapshot_root, epoch))
+        filename_opti = ('%s/opti-best_%d.pth' % (args.snapshot_opt_root, epoch))
+        filename_current = ('%s/feature-current.pth' % (args.snapshot_root))
+        filename_opti_current = ('%s/opti-current.pth' % (args.snapshot_opt_root))
+        torch.save(vae.state_dict(), filename)
+        torch.save(optimizer.state_dict(), filename_opti)
+        torch.save(vae.state_dict(), filename_current)
+        torch.save(optimizer.state_dict(), filename_opti_current)
